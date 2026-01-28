@@ -1,0 +1,256 @@
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SensirionI2cSht4x.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include "esp_sleep.h"
+
+// ================== WIFI SETTINGS ==================
+const char* ssid = "tarun";
+const char* password = "12345678";
+
+// ================== THINGSPEAK SETTINGS ==================
+String thingspeakApiKey = "SBHQ1U5PBQO1KR56";
+const char* thingspeakServer = "http://api.thingspeak.com/update";
+
+// ================== MQTT SETTINGS (RPI BROKER) ==================
+const char* mqtt_server = "10.17.118.76";   // Raspberry Pi IP
+const int mqtt_port = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ================== DEEP SLEEP SETTINGS ==================
+#define uS_TO_S_FACTOR 1000000ULL
+#define TIME_TO_SLEEP 180   // 180 seconds = 3 minutes
+
+// ================== OLED ==================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================== BMP280 ==================
+Adafruit_BMP280 bmp;
+
+// ================== SHT40 ==================
+SensirionI2cSht4x sht4x;
+static char errorMessage[64];
+static int16_t error;
+
+// ================== IR Sensor ==================
+#define IR_PIN 25
+
+// ================== FUNCTIONS ==================
+void setupWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+
+    if (retry > 30) {  // ~15 seconds timeout
+      Serial.println("\nWiFi Failed! Restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+
+    String clientId = "ESP32Weather-" + String(random(0xffff), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Connected!");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 2 sec...");
+      delay(2000);
+    }
+  }
+}
+
+void publishMQTT(float t, float h, float p, int ir) {
+  String dayNight = (ir == 0) ? "Day" : "Night";
+
+  String payload = "{";
+  payload += "\"temperature\":" + String(t) + ",";
+  payload += "\"humidity\":" + String(h) + ",";
+  payload += "\"pressure\":" + String(p) + ",";
+  payload += "\"ir\":" + String(ir) + ",";
+  payload += "\"status\":\"" + dayNight + "\"";
+  payload += "}";
+
+  client.publish("esp32/weather/data", payload.c_str());
+  Serial.println("MQTT Published: " + payload);
+}
+
+void sendToThingSpeak(float t, float h, float p, int ir) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String url = String(thingspeakServer) + "?api_key=" + thingspeakApiKey +
+                 "&field1=" + String(t) +
+                 "&field2=" + String(h) +
+                 "&field3=" + String(p) +
+                 "&field4=" + String(ir);
+
+    Serial.println("Sending to ThingSpeak...");
+    Serial.println(url);
+
+    http.begin(url);
+    int httpCode = http.GET();
+
+    Serial.print("ThingSpeak Response: ");
+    Serial.println(httpCode);
+
+    http.end();
+  } else {
+    Serial.println("WiFi not connected! Reconnecting...");
+    setupWiFi();
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+
+  // I2C pins for ESP32
+  Wire.begin(21, 22);
+
+  pinMode(IR_PIN, INPUT);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found!");
+    while (1);
+  }
+
+  // BMP280 init
+  if (!bmp.begin(0x76)) {   // try 0x77 if not works
+    Serial.println("BMP280 not found!");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.println("BMP280 not found!");
+    display.display();
+    while (1);
+  }
+
+  // SHT40 init (address 0x44)
+  sht4x.begin(Wire, SHT40_I2C_ADDR_44);
+  sht4x.softReset();
+  delay(10);
+
+  // WiFi init
+  setupWiFi();
+
+  // MQTT init
+  client.setServer(mqtt_server, mqtt_port);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("All Sensors OK!");
+  display.println("ThingSpeak Ready!");
+  display.println("MQTT Ready!");
+  display.display();
+  delay(1500);
+}
+
+// ================== LOOP ==================
+void loop() {
+
+  // Connect MQTT
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  // BMP280 readings
+  float bmpTemp = bmp.readTemperature();
+  float pressure = bmp.readPressure() / 100.0; // hPa
+
+  // SHT40 readings
+  float temperature = 0.0;
+  float humidity = 0.0;
+  error = sht4x.measureHighPrecision(temperature, humidity);
+
+  // IR sensor
+  int irValue = digitalRead(IR_PIN);
+
+  // OLED display
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.println("ESP32 Weather Station");
+
+  display.print("BMP T: ");
+  display.print(bmpTemp);
+  display.println(" C");
+
+  display.print("P: ");
+  display.print(pressure);
+  display.println(" hPa");
+
+  if (error == 0) {
+    display.print("Hum: ");
+    display.print(humidity);
+    display.println(" %");
+  } else {
+    display.println("Hum: ERROR");
+    errorToString(error, errorMessage, sizeof(errorMessage));
+    Serial.print("SHT40 Error: ");
+    Serial.println(errorMessage);
+  }
+
+  display.print("IR: ");
+  display.println(irValue == 0 ? "Day" : "Night");
+
+  display.display();
+
+  // Send only if SHT40 is OK
+  if (error == 0) {
+
+    // ThingSpeak
+    sendToThingSpeak(bmpTemp, humidity, pressure, irValue);
+    Serial.println("Sent to ThingSpeak!");
+
+    // MQTT Publish
+    publishMQTT(bmpTemp, humidity, pressure, irValue);
+
+  } else {
+    Serial.println("SHT40 error, not sending data!");
+  }
+
+  Serial.println("----------------------------------");
+
+  // Deep Sleep for 3 minutes
+  Serial.println("Going to deep sleep for 3 minutes...");
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Sleeping 3 mins...");
+  display.display();
+  delay(500);
+
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
+}
